@@ -39,21 +39,31 @@ module Quickhost
         @repo_name = File.basename(url.sub(%r{/+\z}, ""), ".git")
       else
         raise Error, "#{@arg} is not a folder" unless File.directory?(@arg)
-        raise Error, "--branch only works with git URLs; check out the branch locally instead" if @branch
 
-        @root = File.expand_path(@arg)
-        @repo_name = git_toplevel_name || File.basename(@root)
+        @repo_name = git_toplevel_name || File.basename(File.expand_path(@arg))
+        if @branch
+          export_branch
+        else
+          @root = File.expand_path(@arg)
+        end
       end
       self
     end
 
+    # True when a local repo's branch was exported, rather than deploying the folder as it is on disk.
+    def exported_branch? = !remote? && !@branch.nil?
+
     # Short commit sha, if the folder is a git checkout.
     def revision
+      return @revision if @revision
+
       out, _err, status = Open3.capture3("git", "-C", root, "rev-parse", "--short", "HEAD")
       status.success? ? out.strip : nil
     end
 
     def dirty?
+      return false if exported_branch?
+
       out, _err, status = Open3.capture3("git", "-C", root, "status", "--porcelain")
       status.success? && !out.strip.empty?
     end
@@ -63,6 +73,43 @@ module Quickhost
     end
 
     private
+
+    def git(*args)
+      Open3.capture3("git", "-C", @arg, *args, binmode: true)
+    end
+
+    # Copies the committed contents of @branch into a temp folder with `git archive`,
+    # leaving the user's checkout and working tree untouched. Accepts any ref git does
+    # (local branch, origin/branch, tag, commit). Deploying a subfolder exports that
+    # subfolder from the branch.
+    def export_branch
+      _out, _err, status = git("rev-parse", "--git-dir")
+      raise Error, "--branch needs #{@arg} to be a git repo" unless status.success?
+
+      sha, _err, status = git("rev-parse", "--verify", "--quiet", "--short", "#{@branch}^{commit}")
+      # Branches you haven't checked out locally usually still exist as origin/<branch>.
+      sha, _err, status = git("rev-parse", "--verify", "--quiet", "--short", "origin/#{@branch}^{commit}") unless status.success?
+      unless status.success?
+        raise Error, "No branch or commit named '#{@branch}' in #{File.expand_path(@arg)}. " \
+                     "For a branch that only exists on GitHub, run `git fetch` first or use origin/#{@branch}."
+      end
+      @revision = sha.strip
+
+      prefix, _err, _status = git("rev-parse", "--show-prefix")
+      prefix = prefix.strip
+      treeish = prefix.empty? ? @revision : "#{@revision}:#{prefix.chomp('/')}"
+
+      @tmp = Dir.mktmpdir("quickhost-src-")
+      @root = File.join(@tmp, "repo")
+      FileUtils.mkdir_p(@root)
+      # Run from the repo root: from a subfolder, git archive would also filter by that path.
+      top, _err, _status = git("rev-parse", "--show-toplevel")
+      archive, err, status = Open3.capture3("git", "-C", top.strip, "archive", "--format=tar", treeish, binmode: true)
+      raise Error, "git archive failed for #{@branch}:\n#{err.strip}" unless status.success?
+
+      _out, err, status = Open3.capture3("tar", "-x", "-C", @root, stdin_data: archive, binmode: true)
+      raise Error, "Couldn't unpack #{@branch}:\n#{err.strip}" unless status.success?
+    end
 
     def git_toplevel_name
       out, _err, status = Open3.capture3("git", "-C", @arg, "rev-parse", "--show-toplevel")

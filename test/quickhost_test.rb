@@ -234,3 +234,197 @@ class SourceTest < Minitest::Test
     end
   end
 end
+
+class LocalBranchTest < Minitest::Test
+  def setup
+    @dir = Dir.mktmpdir("qh-branch-")
+    @repo = File.join(@dir, "Ball-Game")
+    FileUtils.mkdir_p(File.join(@repo, "site"))
+    sh "init", "-q", "-b", "main"
+    File.write(File.join(@repo, "index.html"), "main")
+    File.write(File.join(@repo, "site", "index.html"), "main-sub")
+    sh "add", "."
+    sh "commit", "-qm", "main"
+    sh "checkout", "-qb", "dev"
+    File.write(File.join(@repo, "index.html"), "dev")
+    File.write(File.join(@repo, "site", "index.html"), "dev-sub")
+    sh "commit", "-qam", "dev"
+    sh "checkout", "-q", "main"
+    File.write(File.join(@repo, "index.html"), "uncommitted")
+  end
+
+  def teardown = FileUtils.rm_rf(@dir)
+
+  def sh(*args)
+    system("git", "-C", @repo, "-c", "user.name=t", "-c", "user.email=t@t", *args, exception: true)
+  end
+
+  def test_exports_other_branch_without_touching_checkout
+    s = Quickhost::Source.new(@repo, branch: "dev").prepare
+    assert s.exported_branch?
+    refute s.dirty?
+    assert_equal "Ball-Game", s.repo_name
+    assert_equal "dev", File.read(File.join(s.root, "index.html"))
+    refute File.exist?(File.join(s.root, ".git"))
+    out, = Open3.capture2("git", "-C", @repo, "rev-parse", "--short", "dev")
+    assert_equal out.strip, s.revision
+    # the user's working tree is untouched
+    assert_equal "uncommitted", File.read(File.join(@repo, "index.html"))
+    out, = Open3.capture2("git", "-C", @repo, "branch", "--show-current")
+    assert_equal "main", out.strip
+    root = s.root
+    s.cleanup
+    refute File.exist?(root)
+  end
+
+  def test_subfolder_exports_that_subfolder_of_branch
+    s = Quickhost::Source.new(File.join(@repo, "site"), branch: "dev").prepare
+    assert_equal "dev-sub", File.read(File.join(s.root, "index.html"))
+    s.cleanup
+  end
+
+  def test_falls_back_to_origin_branch
+    sh "update-ref", "refs/remotes/origin/feature", "dev"
+    sh "branch", "-qD", "dev"
+    s = Quickhost::Source.new(@repo, branch: "feature").prepare
+    assert_equal "dev", File.read(File.join(s.root, "index.html"))
+    s.cleanup
+  end
+
+  def test_unknown_branch_errors
+    err = assert_raises(Quickhost::Error) { Quickhost::Source.new(@repo, branch: "nope").prepare }
+    assert_match(/No branch or commit named 'nope'/, err.message)
+  end
+
+  def test_non_git_folder_errors
+    Dir.mktmpdir do |d|
+      err = assert_raises(Quickhost::Error) { Quickhost::Source.new(d, branch: "dev").prepare }
+      assert_match(/needs .* to be a git repo/, err.message)
+    end
+  end
+
+  def test_without_branch_uses_folder_on_disk
+    s = Quickhost::Source.new(@repo).prepare
+    refute s.exported_branch?
+    assert s.dirty?
+    assert_equal File.expand_path(@repo), s.root
+  end
+end
+
+class OutputDirTest < Minitest::Test
+  include Helpers
+
+  NPM = '{"scripts":{"build":"node build.js"}}'
+
+  def site(files) = Quickhost::Site.new(root: repo(files), config: config, fallback_name: "auto-boss")
+
+  def test_capacitor_web_dir_comes_first
+    s = site("package.json" => NPM, "capacitor.config.json" => '{"webDir":"./app-www/"}')
+    assert_equal "app-www", s.output_dirs.first
+    assert_includes s.output_dirs, "www"
+  end
+
+  def test_unsafe_capacitor_web_dir_ignored
+    s = site("package.json" => NPM, "capacitor.config.json" => '{"webDir":"../etc; rm -rf /"}')
+    assert_equal Quickhost::Site::OUTPUT_DIRS, s.output_dirs
+  end
+
+  # Runs the Dockerfile's "pick the output" step with sh, pointing /site at a temp folder.
+  def pick_output(s, built)
+    line = Quickhost::BuildContext.new(s).dockerfile.lines.find { |l| l.start_with?("RUN for d in") }
+    Dir.mktmpdir do |work|
+      out = File.join(work, "site")
+      src = File.join(work, "src")
+      built.each { |path, body| FileUtils.mkdir_p(File.dirname(File.join(src, path))); File.write(File.join(src, path), body) }
+      ok = system("sh", "-c", line.delete_prefix("RUN ").gsub("/site", out), chdir: src, out: File::NULL, err: File::NULL)
+      return [ok, ok ? Dir.glob("**/*", base: out).sort : []]
+    end
+  end
+
+  def test_auto_boss_layout_serves_www
+    s = site("package.json" => NPM, "capacitor.config.json" => '{"webDir":"www"}')
+    ok, files = pick_output(s, "index.html" => "x", "www/index.html" => "x", "build.js" => "", "node_modules/a/b.js" => "")
+    assert ok
+    assert_equal ["index.html"], files
+  end
+
+  def test_falls_back_to_repo_root_without_node_modules
+    s = site("package.json" => NPM)
+    ok, files = pick_output(s, "index.html" => "x", "game.js" => "", "node_modules/a/b.js" => "")
+    assert ok
+    assert_equal ["game.js", "index.html"], files
+  end
+
+  def test_fails_when_no_index_anywhere
+    s = site("package.json" => NPM)
+    ok, = pick_output(s, "game.js" => "")
+    refute ok
+  end
+end
+
+class HubTest < Minitest::Test
+  include Helpers
+
+  TABLE = "\e[3;94mService\e[0m                     \e[3;94mHost\e[0m                                               \e[3;94mPath\e[0m  \e[3;94mTarget\e[0m              \e[3;94mState\e[0m    \e[3;94mTLS\e[0m  \n" \
+          "\e[1;34mbluemap\e[0m                     \e[mmap.whittleadams.com\e[0m                               \e[m/\e[0m     \e[m192.168.0.253:8100\e[0m  \e[mrunning\e[0m  \e[myes\e[0m  \n" \
+          "\e[1;34mproductivity_diary_api-web\e[0m  \e[mdiary.whittleadams.com,diary.louislab.duckdns.org\e[0m  \e[m/\e[0m     \e[m577d20c2eb61:3000\e[0m   \e[mrunning\e[0m  \e[myes\e[0m  \n" \
+          "\e[1;34mqh-sites\e[0m                    \e[msites.whittleadams.com\e[0m                             \e[m/\e[0m     \e[mqh-sites-1:80\e[0m        \e[mrunning\e[0m  \e[myes\e[0m  \n" \
+          "\e[1;34mqh-oaat\e[0m                     \e[moaat.whittleadams.com\e[0m                              \e[m/\e[0m     \e[mqh-oaat-1:80\e[0m         \e[mrunning\e[0m  \e[myes\e[0m  \n"
+
+  FakeRoutes = Struct.new(:proxy_list)
+
+  class OfflineHub < Quickhost::Hub
+    PAGES = {
+      "https://oaat.whittleadams.com/" => [200, %(<title>OAAT &amp; co</title><meta name="description" content="Read &lt;fast&gt;">)],
+      "https://diary.whittleadams.com/" => [404, ""],
+    }.freeze
+
+    private
+
+    def fetch(url, **) = PAGES.fetch(url, ["SocketError", ""])
+  end
+
+  def hub(**cfg) = OfflineHub.new(config: config(**cfg), deployer: nil, routes_from: FakeRoutes.new(TABLE), out: StringIO.new)
+
+  def test_parse_routes_strips_colours_and_takes_first_host
+    routes = Quickhost::Hub.parse_routes(TABLE)
+    assert_equal %w[bluemap productivity_diary_api-web qh-sites qh-oaat], routes.map { _1[:service] }
+    assert_equal "diary.whittleadams.com", routes[1][:host]
+    assert_equal "running", routes[0][:state]
+  end
+
+  def test_entries_skip_hub_itself_and_hidden_sites
+    entries = hub(hub_hide: ["map.whittleadams.com"]).entries
+    assert_equal %w[diary.whittleadams.com oaat.whittleadams.com], entries.map(&:host)
+    assert_equal %w[oaat.whittleadams.com], hub(hub_hide: "diary,map.whittleadams.com").entries.map(&:host)
+  end
+
+  def test_hub_sites_overrides_wording
+    sites = { "map" => { "title" => "Minecraft Map", "description" => "Live 3D map" },
+              "qh-oaat" => { "description" => "" },
+              "diary.whittleadams.com" => { "title" => "  " } }
+    entries = hub(hub_sites: sites).entries.to_h { [_1.host, _1] }
+    assert_equal "Minecraft Map", entries["map.whittleadams.com"].title
+    assert_equal "Live 3D map", entries["map.whittleadams.com"].description
+    assert_equal "OAAT & co", entries["oaat.whittleadams.com"].title
+    assert_nil entries["oaat.whittleadams.com"].description, "empty description removes the site's own"
+    assert_equal "Diary", entries["diary.whittleadams.com"].title, "blank title falls back"
+  end
+
+  def test_titles_status_and_escaping
+    entries = hub.entries.to_h { [_1.host, _1] }
+    oaat = entries["oaat.whittleadams.com"]
+    assert_equal "OAAT & co", oaat.title
+    assert_equal "Read <fast>", oaat.description
+    assert entries["diary.whittleadams.com"].up?, "a 404 from an API still counts as up"
+    refute entries["map.whittleadams.com"].up?
+    assert_equal "Map", entries["map.whittleadams.com"].title
+
+    html = hub.html(now: Time.utc(2026, 11, 10, 12))
+    assert_includes html, "OAAT &amp; co"
+    assert_includes html, "Read &lt;fast&gt;"
+    refute_includes html, "sites.whittleadams.com\""
+    assert_includes html, "3 sites · 2 up"
+    assert_includes html, %(href="https://oaat.whittleadams.com")
+  end
+end

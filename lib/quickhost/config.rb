@@ -11,7 +11,10 @@ module Quickhost
       "network"         => "kamal",                # docker network kamal-proxy is attached to
       "proxy_container" => "kamal-proxy",          # name of the running kamal-proxy container
       "tls"             => true,                   # let kamal-proxy fetch Let's Encrypt certs
-      "keep_images"     => 3                       # old images kept per site for rollback
+      "keep_images"     => 3,                      # old images kept per site for rollback
+      "hub_name"        => "sites",                # `quickhost hub` lands on <hub_name>.<base_domain>
+      "hub_hide"        => [],                     # sites to leave off the hub: name, host, or subdomain
+      "hub_sites"       => {}                      # per-site hub wording: { map: { title:, description: } }
     }.freeze
 
     ENV_KEYS = DEFAULTS.keys.to_h { |k| [k, "QUICKHOST_#{k.upcase}"] }.freeze

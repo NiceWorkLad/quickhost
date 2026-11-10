@@ -5,7 +5,7 @@ module Quickhost
   # Everything about one site: its name, public host, and how to turn the repo into static files.
   class Site
     SERVICE_PREFIX = "qh-".freeze                  # keeps our services apart from Kamal apps
-    OUTPUT_DIRS = %w[dist build out _site public].freeze
+    OUTPUT_DIRS = %w[dist build out _site public www].freeze
     REPO_CONFIG = ".quickhost.yml".freeze
     LABEL = "quickhost.site".freeze
 
@@ -88,6 +88,13 @@ module Quickhost
       end
     end
 
+    # Where to look for the build's index.html, in order. A Capacitor/Ionic app's configured
+    # webDir comes first; the repo root is checked last (by the Dockerfile) for builds that
+    # write index.html in place, GitHub Pages style.
+    def output_dirs
+      ([capacitor_web_dir] + OUTPUT_DIRS).compact.uniq
+    end
+
     def node_image
       options["node_image"] || "node:22-alpine"
     end
@@ -113,6 +120,16 @@ module Quickhost
       JSON.parse(File.read(pkg)).dig("scripts", "build").to_s.strip != ""
     rescue JSON::ParserError
       false
+    end
+
+    def capacitor_web_dir
+      path = File.join(root, "capacitor.config.json")
+      return unless File.exist?(path)
+
+      dir = JSON.parse(File.read(path))["webDir"].to_s.sub(%r{\A\./}, "").chomp("/")
+      dir if dir.match?(%r{\A[\w.-]+(/[\w.-]+)*\z}) && !dir.split("/").include?("..") && dir != "."
+    rescue JSON::ParserError
+      nil
     end
 
     def repo_options

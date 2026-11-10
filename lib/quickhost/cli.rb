@@ -11,18 +11,23 @@ module Quickhost
         quickhost logs NAME [-f]
         quickhost rollback NAME [--to TAG]
         quickhost remove NAME [--yes]
+        quickhost hub [--name NAME] [--out FILE] [--dry-run]
         quickhost doctor
         quickhost init [--server user@host] [--base-domain example.com]
 
       Deploy options:
         -n, --name NAME        Site name (default: repo/folder name) → NAME.<base_domain>
         -d, --domain HOST      Serve on this exact hostname instead (e.g. blog.example.com)
-        -b, --branch BRANCH    Branch to clone (git URLs only)
+        -b, --branch BRANCH    Branch, tag or commit to deploy (local repos too)
             --build CMD        Build command to run in a Node container
             --dir DIR          Folder to serve (or build output folder)
             --spa              Send unknown paths to index.html (React/Vue routers)
             --dry-run          Print the server commands without running them
         -v, --verbose          Stream the full Docker build log
+
+      hub builds a link page of every site kamal-proxy routes (quickhost sites and Kamal apps)
+      and deploys it to <hub_name>.<base_domain> (default: sites). --out FILE only writes the page.
+      Hide sites with `hub_hide:` in the config file.
 
       Per-repo defaults can live in .quickhost.yml (name, domain, build, dir, spa, node_image).
       Config: #{Config.default_path}
@@ -45,6 +50,7 @@ module Quickhost
       when "logs"              then logs(argv)
       when "rollback"          then rollback(argv)
       when "remove", "rm"      then remove(argv)
+      when "hub"               then hub(argv)
       when "doctor"            then doctor(argv)
       when "init"              then init(argv)
       when nil, "help", "-h", "--help" then @out.puts(USAGE); 0
@@ -81,6 +87,7 @@ module Quickhost
       source = Source.new(argv.first, branch: branch)
       @out.puts "→ Fetching #{source.url}" if source.remote?
       source.prepare
+      @out.puts "→ Using #{branch} (#{source.revision}) — committed files only" if source.exported_branch?
       site = Site.new(root: source.root, config: config, options: opts, fallback_name: source.repo_name)
       site.host # validate early
       site.mode
@@ -141,6 +148,32 @@ module Quickhost
       end
       deployer(Config.load).remove(name)
       @out.puts "✓ Removed #{name}"
+      0
+    end
+
+    def hub(argv)
+      name = nil
+      out_file = nil
+      dry_run = false
+      OptionParser.new do |o|
+        o.on("-n", "--name NAME") { |v| name = v }
+        o.on("-o", "--out FILE") { |v| out_file = v }
+        o.on("--dry-run") { dry_run = true }
+      end.parse!(argv)
+      config = Config.load
+      remote = Remote.new(config.server, dry_run: dry_run, out: @out)
+      writer = Deployer.new(config: config, remote: remote, out: @out)
+      # Listing routes and checking sites are read-only, so they use a live connection even in a dry run.
+      hub = Hub.new(config: config, deployer: writer, routes_from: deployer(config), name: name, out: @out)
+      if out_file
+        File.write(out_file, hub.html)
+        @out.puts "✓ Wrote #{out_file} (#{hub.entries.size} sites)"
+        return 0
+      end
+
+      @out.puts "(dry run — nothing will change on the server)" if dry_run
+      hub.deploy
+      @out.puts "\n✓ #{dry_run ? 'Would be live' : 'Live'} at #{hub.scheme}://#{hub.host}"
       0
     end
 

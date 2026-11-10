@@ -6,8 +6,8 @@ GitHub-Pages-style hosting on your own server. Point it at a repo and it comes u
 ```
 $ quickhost deploy NiceWorkLad/Ball-Game
 → Fetching https://github.com/NiceWorkLad/Ball-Game.git
-→ Checking niceworklad@srv-01
-→ Building quickhost/ball-game:20261110143000-5af19fc on niceworklad@srv-01 (static)
+→ Checking louislab.duckdns.org
+→ Building quickhost/ball-game:20261110143000-5af19fc on louislab.duckdns.org (static)
 → Starting qh-ball-game-20261110143000-5af19fc
 → Routing https://ball-game.whittleadams.com → qh-ball-game-20261110143000-5af19fc
 
@@ -46,7 +46,7 @@ straight away.
 ```bash
 git clone <this repo> ~/code/quickhost
 ln -s ~/code/quickhost/bin/quickhost ~/.local/bin/quickhost   # anywhere on your PATH
-quickhost init --server niceworklad@srv-01 --base-domain whittleadams.com
+quickhost init --server louislab.duckdns.org --base-domain whittleadams.com
 quickhost doctor
 ```
 
@@ -62,6 +62,8 @@ quickhost deploy                       # current folder → <folder-name>.whittl
 quickhost deploy ~/code/my-site        # any local folder
 quickhost deploy NiceWorkLad/Ball-Game # GitHub shorthand (cloned fresh)
 quickhost deploy https://github.com/NiceWorkLad/Ball-Game.git --branch gh-pages
+quickhost deploy --branch dev          # another branch of the local repo, without checking it out
+quickhost deploy --branch dev --name ball-game-dev   # …as a separate preview site
 
 quickhost deploy --name keepup         # → keepup.whittleadams.com
 quickhost deploy --domain games.example.com   # any hostname you own; point its DNS at your IP first
@@ -72,6 +74,35 @@ quickhost logs ball-game -f            # nginx access log
 quickhost rollback ball-game           # back to the previous version
 quickhost rollback ball-game --to 20261110143000-5af19fc
 quickhost remove ball-game             # take it offline and delete images
+quickhost hub                          # link page of every site → sites.whittleadams.com
+```
+
+### The hub page
+
+`quickhost hub` builds a link-tree page of everything kamal-proxy is routing: quickhost sites
+and Kamal apps alike. Each card uses the site's own `<title>` and meta description, and shows
+whether it answered when the page was built. Rerun it after deploying or removing a site.
+
+```bash
+quickhost hub                  # deploy to sites.whittleadams.com
+quickhost hub --name links     # → links.whittleadams.com (or set hub_name in the config)
+quickhost hub --out hub.html   # just write the page locally to preview it
+```
+
+Leave sites off with `hub_hide` in `~/.config/quickhost/config.yml` (site name, host or subdomain):
+
+```yaml
+hub_hide: [diary, deadlock-meta]
+```
+
+Change a card's wording with `hub_sites`, keyed the same way. `description: ""` removes the
+site's own description.
+
+```yaml
+hub_sites:
+  map:
+    title: Minecraft Map
+    description: Live 3D map of our server
 ```
 
 ### What gets served
@@ -106,7 +137,7 @@ spa: true
 `~/.config/quickhost/config.yml` (written by `quickhost init`):
 
 ```yaml
-server: niceworklad@srv-01
+server: louislab.duckdns.org
 base_domain: whittleadams.com
 network: kamal
 proxy_container: kamal-proxy

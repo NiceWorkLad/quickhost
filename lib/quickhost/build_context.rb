@@ -31,9 +31,13 @@ module Quickhost
                  "test -d #{shell_word(out)} || (echo 'Build output folder #{out} not found' >&2; exit 1); " \
                  "mkdir -p /site && cp -a #{shell_word(out)}/. /site/"
                else
-                 "for d in #{Site::OUTPUT_DIRS.join(' ')}; do " \
+                 # Try each likely output folder; as a last resort serve the repo root, for builds
+                 # that write index.html in place (GitHub Pages style).
+                 dirs = @site.output_dirs
+                 "for d in #{dirs.map { |d| shell_word(d) }.join(' ')}; do " \
                  "if [ -f \"$d/index.html\" ]; then mkdir -p /site && cp -a \"$d\"/. /site/ && echo \"Serving $d/\" && break; fi; done; " \
-                 "test -f /site/index.html || (echo 'Build finished but no index.html found in #{Site::OUTPUT_DIRS.join(', ')}. Set --dir.' >&2; exit 1)"
+                 "if [ ! -f /site/index.html ] && [ -f index.html ]; then mkdir -p /site && cp -a . /site/ && rm -rf /site/node_modules && echo 'Serving repo root'; fi; " \
+                 "test -f /site/index.html || (echo 'Build finished but no index.html found in #{dirs.join(', ')} or the repo root. Set --dir.' >&2; exit 1)"
                end
         <<~DOCKER
           FROM #{@site.node_image} AS build
