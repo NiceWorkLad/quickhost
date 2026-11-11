@@ -1,9 +1,12 @@
 require "open3"
 require "tmpdir"
+require "json"
 
 module Quickhost
   # Talks to Docker and kamal-proxy on the server.
   class Deployer
+    CONNECTION_LABELS = %w[quickhost.repo quickhost.branch quickhost.commit quickhost.options].freeze
+
     def initialize(config:, remote:, out: $stdout, verbose: false)
       @config = config
       @remote = remote
@@ -23,7 +26,11 @@ module Quickhost
     end
 
     # Build, start, route, and clean up. Returns the new container name.
-    def deploy(site, source)
+    # A site deployed from a git URL is "connected": its container records the repo, the branch,
+    # the commit and the deploy options, which is all `quickhost sync` needs to keep it up to date.
+    # synced: the remote commit this deploy answers, when sync already looked it up.
+    def deploy(site, source, synced: nil)
+      labels = source.remote? ? connection_labels(site, source, synced) : {}
       tag = version_tag(source.revision)
       container = "#{site.service}-#{tag}"
       image_ref = "#{site.image}:#{tag}"
@@ -42,7 +49,7 @@ module Quickhost
       end
 
       begin
-        start_and_route(site, image_ref, container)
+        start_and_route(site, image_ref, container, labels)
       rescue Error
         docker("rmi", image_ref, allow_fail: true)
         raise
@@ -68,14 +75,30 @@ module Quickhost
       host = current_host(site) || site.host
       site.host_override = host
       container = "#{site.service}-#{target}-rb#{Time.now.utc.strftime('%H%M%S')}"
-      start_and_route(site, "#{site.image}:#{target}", container)
+      # A connected site stays connected, and keeps the commit it was rolled back from as the one
+      # it has handled: sync leaves the rollback alone until the branch moves again.
+      kept = (sites.find { |s| s["quickhost.site"] == site.name } || {}).select { |k, _| CONNECTION_LABELS.include?(k) }
+      start_and_route(site, "#{site.image}:#{target}", container, kept)
       cleanup_containers(site, keep: container)
       container
     end
 
     def list
       docker("ps", "-a", "--filter", "label=#{Site::LABEL}",
-             "--format", "{{.Label \"#{Site::LABEL}\"}}\t{{.Label \"quickhost.host\"}}\t{{.Image}}\t{{.Status}}").out
+             "--format", "{{.Label \"#{Site::LABEL}\"}}\t{{.Label \"quickhost.host\"}}\t{{.Image}}\t{{.Status}}" \
+                         "\t{{.Label \"quickhost.repo\"}}\t{{.Label \"quickhost.branch\"}}").out
+    end
+
+    # Every running site as its container labels: quickhost.site, quickhost.host and, for connected
+    # sites, quickhost.repo / .branch / .commit / .options.
+    def sites
+      ids = docker("ps", "-q", "--filter", "label=#{Site::LABEL}").out.split
+      return [] if ids.empty?
+
+      docker("inspect", "-f", "{{json .Config.Labels}}", *ids).out.lines.filter_map do |line|
+        labels = JSON.parse(line) rescue nil
+        labels if labels.is_a?(Hash) && labels[Site::LABEL]
+      end
     end
 
     def remove(name)
@@ -113,13 +136,14 @@ module Quickhost
 
     private
 
-    def start_and_route(site, image_ref, container)
+    def start_and_route(site, image_ref, container, labels = {})
       step "Starting #{container}"
       docker("run", "-d", "--name", container,
              "--network", @config.network,
              "--restart", "unless-stopped",
              "--label", "#{Site::LABEL}=#{site.name}",
              "--label", "quickhost.host=#{site.host}",
+             *labels.flat_map { |k, v| ["--label", "#{k}=#{v}"] },
              image_ref)
 
       step "Routing https://#{site.host} → #{container}"
@@ -133,6 +157,12 @@ module Quickhost
                "\nAnother app (maybe a Kamal deploy) already owns #{site.host}. Pick another --name or --domain."
              end
       raise Error, "kamal-proxy refused the deploy; old version is still live.\n#{result.err.strip}#{hint}"
+    end
+
+    def connection_labels(site, source, synced)
+      options = site.cli_options.merge("name" => site.name)
+      { "quickhost.repo" => source.url, "quickhost.branch" => source.branch.to_s,
+        "quickhost.commit" => (synced || source.commit).to_s, "quickhost.options" => JSON.generate(options) }
     end
 
     def cleanup_containers(site, keep:)
