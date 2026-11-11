@@ -14,7 +14,8 @@ module Quickhost
       "keep_images"     => 3,                      # old images kept per site for rollback
       "hub_name"        => "sites",                # `quickhost hub` lands on <hub_name>.<base_domain>
       "hub_hide"        => [],                     # sites to leave off the hub: name, host, or subdomain
-      "hub_sites"       => {}                      # per-site hub wording: { map: { title:, description: } }
+      "hub_sites"       => {},                     # per-site hub wording: { map: { title:, description: } }
+      "sync_skip"       => []                      # connected sites `quickhost sync` should leave alone, by name
     }.freeze
 
     ENV_KEYS = DEFAULTS.keys.to_h { |k| [k, "QUICKHOST_#{k.upcase}"] }.freeze

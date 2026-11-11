@@ -9,7 +9,7 @@ module Quickhost
     GIT_URL = %r{\A(https?://|ssh://|git@|file://)}
     SHORTHAND = %r{\A[\w.-]+/[\w.-]+\z}
 
-    attr_reader :root, :repo_name
+    attr_reader :root, :repo_name, :branch
 
     def initialize(arg, branch: nil)
       @arg = arg || "."
@@ -59,6 +59,28 @@ module Quickhost
 
       out, _err, status = Open3.capture3("git", "-C", root, "rev-parse", "--short", "HEAD")
       status.success? ? out.strip : nil
+    end
+
+    # Full commit sha of what is being deployed, if it is a git checkout.
+    def commit
+      return @commit if defined?(@commit)
+
+      out, _err, status = Open3.capture3("git", "-C", root, "rev-parse", "HEAD")
+      @commit = status.success? && !exported_branch? ? out.strip : nil
+    end
+
+    # The commit a branch (or the default branch) points at on the remote, without cloning.
+    # One small request, and not one that counts against GitHub's API rate limit.
+    def self.remote_commit(url, branch = nil)
+      env = { "GIT_TERMINAL_PROMPT" => "0", "GIT_HTTP_LOW_SPEED_LIMIT" => "1000", "GIT_HTTP_LOW_SPEED_TIME" => "20" }
+      out, err, status = Open3.capture3(env, "git", "ls-remote", url, branch || "HEAD")
+      raise Error, "git ls-remote failed for #{url}: #{err.strip.lines.last.to_s.strip}" unless status.success?
+
+      lines = out.lines.map(&:split).reject(&:empty?)
+      line = lines.find { |_sha, ref| ref == "refs/heads/#{branch}" } || lines.first
+      raise Error, "No branch '#{branch || 'HEAD'}' on #{url}" unless line
+
+      line.first
     end
 
     def dirty?

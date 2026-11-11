@@ -428,3 +428,148 @@ class HubTest < Minitest::Test
     assert_includes html, %(href="https://oaat.whittleadams.com")
   end
 end
+
+class RemoteLocalTest < Minitest::Test
+  def test_local_server_runs_without_ssh
+    remote = Quickhost::Remote.new("local")
+    assert remote.local?
+    assert_equal "a b\n", remote.run("echo", "a b").out
+    refute Quickhost::Remote.new("niceworklad@srv-01").local?
+  end
+end
+
+# sync against a real git repo (a file:// remote), with Docker faked.
+class SyncTest < Minitest::Test
+  include Helpers
+
+  def git(*args) = system("git", "-C", @origin, *args, out: File::NULL, err: File::NULL) || flunk("git #{args.join(' ')}")
+
+  def commit(body)
+    File.write(File.join(@origin, "index.html"), body)
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", body)
+    `git -C #{@origin} rev-parse deploy`.strip
+  end
+
+  def setup
+    @origin = Dir.mktmpdir("qh-origin-")
+    system("git", "init", "-q", "-b", "deploy", @origin) || flunk
+    @first = commit("one")
+    @url = "file://#{@origin}"
+    @remote = FakeRemote.new
+    @out = StringIO.new
+    @deployer = Quickhost::Deployer.new(config: config, remote: @remote, out: @out)
+    @state = File.join(Dir.mktmpdir("qh-state-"), "sync.json")
+    live(@first)
+  end
+
+  # What the server reports as running: one connected site at `commit`, and one deployed from a folder.
+  def live(commit, options: { "name" => "game" })
+    labels = { "quickhost.site" => "game", "quickhost.host" => "game.whittleadams.com", "quickhost.repo" => @url,
+               "quickhost.branch" => "deploy", "quickhost.commit" => commit, "quickhost.options" => JSON.generate(options) }
+    folder = { "quickhost.site" => "notes", "quickhost.host" => "notes.whittleadams.com" }
+    @remote.responses["ps -q --filter label=quickhost.site"] = R.new(true, "aaa\nbbb\n", "")
+    @remote.responses["json .Config.Labels"] = R.new(true, [labels, folder].map { |l| JSON.generate(l) }.join("\n") + "\n", "")
+  end
+
+  def sync(**over) = Quickhost::Sync.new(config: config(**over), deployer: @deployer, out: @out, state_path: @state)
+  def built? = @remote.log.any? { |c| c.include?("docker build") }
+
+  def test_remote_commit_reads_the_branch_without_cloning
+    assert_equal @first, Quickhost::Source.remote_commit(@url, "deploy")
+    assert_equal @first, Quickhost::Source.remote_commit(@url)
+    assert_raises(Quickhost::Error) { Quickhost::Source.remote_commit(@url, "nope") }
+  end
+
+  def test_nothing_happens_while_the_branch_is_where_it_was
+    results = sync.run
+    assert_equal [["game", :current]], results.map { |r| [r.name, r.status] }   # the folder site isn't watched
+    refute built?
+  end
+
+  def test_new_commit_redeploys_with_the_same_options_and_records_it
+    second = commit("two")
+    live(@first, options: { "name" => "game", "domain" => "play.example.com" })
+    results = sync.run
+    assert_equal :deployed, results.first.status
+    run = @remote.log.find { |c| c.include?("docker run") }
+    assert_includes run, "--label quickhost.site=game"
+    assert_includes run, "--label quickhost.host=play.example.com"
+    assert_includes run, "--label quickhost.repo=#{@url}"
+    assert_includes run, "--label quickhost.branch=deploy"
+    assert_includes run, "--label quickhost.commit=#{second}"
+    assert_includes @remote.log.join("\n"), "kamal-proxy deploy qh-game"
+  end
+
+  def test_dry_run_only_reports
+    commit("two")
+    assert_equal :would_deploy, sync.run(dry_run: true).first.status
+    refute built?
+    refute File.exist?(@state)
+  end
+
+  def test_failed_commit_is_tried_once_then_waits_for_the_next_one
+    commit("broken")
+    @remote.responses["docker build"] = R.new(false, "", "boom\n")
+    assert_equal :failed, sync.run.first.status
+    @remote.log.clear
+    assert_equal :waiting, sync.run.first.status
+    refute built?
+
+    commit("fixed")
+    @remote.responses.delete("docker build")
+    assert_equal :deployed, sync.run.first.status
+    assert_equal({}, JSON.parse(File.read(@state)))
+  end
+
+  def test_only_and_skip
+    commit("two")
+    assert_empty sync.run(only: ["other"])
+    assert_equal :skipped, sync(sync_skip: ["game"]).run.first.status
+    refute built?
+  end
+
+  def test_manual_deploy_from_a_url_connects_the_site
+    source = Quickhost::Source.new(@url, branch: "deploy").prepare
+    site = Quickhost::Site.new(root: source.root, config: config, options: { name: "game", spa: true }, fallback_name: source.repo_name)
+    @deployer.deploy(site, source)
+    run = @remote.log.find { |c| c.include?("docker run") }
+    assert_includes run, "--label quickhost.commit=#{@first}"
+    assert_includes run, %(--label quickhost.options={"name":"game","spa":true})
+  ensure
+    source&.cleanup
+  end
+
+  def test_folder_deploys_are_not_connected
+    root = repo("index.html" => "hi")
+    @deployer.deploy(Quickhost::Site.new(root: root, config: config, fallback_name: "notes"), Quickhost::Source.new(root).prepare)
+    refute_includes @remote.log.find { |c| c.include?("docker run") }, "quickhost.repo"
+  end
+
+  def test_rollback_stays_connected_and_is_left_alone
+    second = commit("two")
+    live(second)
+    @remote.responses["image ls quickhost/game"] = R.new(true, "20260102000000-bbb\n20260101000000-aaa\n", "")
+    @remote.responses["ps --filter label=quickhost.site=game"] = R.new(true, "qh-game-20260102000000-bbb\n", "")
+    @remote.responses["inspect -f {{.Config.Image}}"] = R.new(true, "quickhost/game:20260102000000-bbb\n", "")
+    @deployer.rollback("game")
+    run = @remote.log.find { |c| c.include?("docker run") }
+    assert_includes run, "quickhost/game:20260101000000-aaa"
+    assert_includes run, "--label quickhost.commit=#{second}"    # the commit rolled back from counts as handled
+    assert_includes run, "--label quickhost.repo=#{@url}"
+  end
+
+  def test_install_writes_timer_units
+    dir = Dir.mktmpdir("qh-xdg-")
+    old = ENV["XDG_CONFIG_HOME"]
+    ENV["XDG_CONFIG_HOME"] = dir
+    out = StringIO.new
+    assert_equal 0, Quickhost::CLI.start(%w[sync --install --interval 60], out: out, err: out)
+    timer = File.read(File.join(dir, "systemd", "user", "quickhost-sync.timer"))
+    assert_includes timer, "OnUnitActiveSec=60"
+    assert_match(%r{ExecStart=\S+ \S+/bin/quickhost sync}, File.read(File.join(dir, "systemd", "user", "quickhost-sync.service")))
+    assert_equal 1, Quickhost::CLI.start(%w[sync --install --interval 5], out: out, err: out)
+  ensure
+    ENV["XDG_CONFIG_HOME"] = old
+  end
+end

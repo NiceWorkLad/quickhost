@@ -9,14 +9,17 @@ module Quickhost
     REPO_CONFIG = ".quickhost.yml".freeze
     LABEL = "quickhost.site".freeze
 
-    attr_reader :name, :root, :options
+    # cli_options: only what was passed on the command line, which is what a later sync must repeat
+    # (the repo's own .quickhost.yml is read again from the new commit).
+    attr_reader :name, :root, :options, :cli_options
 
     # options (all optional; CLI flags beat .quickhost.yml):
     #   name, domain, build, dir, spa, node_image
     def initialize(root:, config:, options: {}, fallback_name: nil)
       @root = File.expand_path(root)
       @config = config
-      @options = repo_options.merge(options.compact.transform_keys(&:to_s))
+      @cli_options = options.compact.transform_keys(&:to_s)
+      @options = repo_options.merge(@cli_options)
       @name = self.class.sanitize(@options["name"] || fallback_name || File.basename(@root))
       raise Error, "Could not work out a site name; pass --name" if @name.empty?
     end

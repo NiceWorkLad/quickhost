@@ -77,6 +77,57 @@ quickhost remove ball-game             # take it offline and delete images
 quickhost hub                          # link page of every site → sites.whittleadams.com
 ```
 
+### Auto-deploy: follow a branch
+
+A site deployed from a repo (a git URL or `owner/repo`) is **connected**: quickhost records the
+repo, the branch, the commit and the options you passed on its container. `quickhost sync` then
+keeps every connected site up to date:
+
+```bash
+quickhost deploy NiceWorkLad/Auto-Boss --branch deploy   # connect it once
+quickhost list                                           # "← NiceWorkLad/Auto-Boss@deploy" marks connected sites
+quickhost sync -v                                        # check them all now
+quickhost sync --dry-run                                 # say what would deploy, change nothing
+quickhost sync auto-boss                                 # just one site
+```
+
+A pass asks each repo which commit its branch is on (`git ls-remote`: no clone, and not a call
+that counts against GitHub's API limit), and redeploys only the sites whose branch has moved.
+Sites deployed from a folder on your machine are never touched, and neither is the hub.
+
+**Run it every minute on the server.** quickhost normally reaches the server over SSH; on the
+server itself, tell it the server is this machine:
+
+```bash
+# on srv-01, once
+sudo apt install -y ruby git
+git clone https://github.com/NiceWorkLad/quickhost ~/quickhost
+~/quickhost/bin/quickhost init --server local --base-domain whittleadams.com
+~/quickhost/bin/quickhost doctor
+~/quickhost/bin/quickhost sync --install          # writes a systemd timer (--interval 60 by default)
+systemctl --user daemon-reload
+systemctl --user enable --now quickhost-sync.timer
+sudo loginctl enable-linger $USER                 # keeps it running when you're logged out
+journalctl --user -u quickhost-sync -f            # watch it work
+```
+
+After that a release is a push to the branch the site follows, from anywhere:
+
+```bash
+git push origin main:deploy
+```
+
+How it behaves:
+
+- **A commit that fails to build is tried once.** The live site keeps serving, the failure is logged,
+  and sync waits for the next commit instead of rebuilding the broken one every minute.
+- **A rollback sticks.** `quickhost rollback` keeps the site connected and counts the commit you
+  rolled back from as handled, so sync leaves the old version up until the branch moves again.
+- **One pass at a time.** A pass that is still building makes the next tick a no-op.
+- **To stop following a site**, add it to `sync_skip` in the config, or redeploy it from a folder.
+- **Sites deployed before v0.3** have nothing recorded: redeploy each from its repo once to connect it.
+- **Private repos** need the server to be able to read them (a read-only deploy key, with an SSH git URL).
+
 ### The hub page
 
 `quickhost hub` builds a link-tree page of everything kamal-proxy is routing: quickhost sites
