@@ -14,7 +14,9 @@ module Quickhost
       "keep_images"     => 3,                      # old images kept per site for rollback
       "hub_name"        => "sites",                # `quickhost hub` lands on <hub_name>.<base_domain>
       "hub_hide"        => [],                     # sites to leave off the hub: name, host, or subdomain
-      "hub_sites"       => {}                      # per-site hub wording: { map: { title:, description: } }
+      "hub_sites"       => {},                     # per-site hub wording: { map: { title:, description: } }
+      "auth_user"       => nil,                    # sign-in for private sites (`private: true` / --private)
+      "auth_password"   => nil
     }.freeze
 
     ENV_KEYS = DEFAULTS.keys.to_h { |k| [k, "QUICKHOST_#{k.upcase}"] }.freeze
@@ -56,6 +58,7 @@ module Quickhost
     def write!
       FileUtils.mkdir_p(File.dirname(path))
       File.write(path, YAML.dump(values))
+      File.chmod(0o600, path) # it can hold auth_password
     end
   end
 end

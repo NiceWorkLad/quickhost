@@ -22,6 +22,7 @@ module Quickhost
             --build CMD        Build command to run in a Node container
             --dir DIR          Folder to serve (or build output folder)
             --spa              Send unknown paths to index.html (React/Vue routers)
+            --private          Ask for the config's auth_user / auth_password before serving
             --dry-run          Print the server commands without running them
         -v, --verbose          Stream the full Docker build log
 
@@ -29,7 +30,7 @@ module Quickhost
       and deploys it to <hub_name>.<base_domain> (default: sites). --out FILE only writes the page.
       Hide sites with `hub_hide:` in the config file.
 
-      Per-repo defaults can live in .quickhost.yml (name, domain, build, dir, spa, node_image).
+      Per-repo defaults can live in .quickhost.yml (name, domain, build, dir, spa, private, node_image).
       Config: #{Config.default_path}
     TXT
 
@@ -78,6 +79,7 @@ module Quickhost
         o.on("--build CMD") { |v| opts[:build] = v }
         o.on("--dir DIR") { |v| opts[:dir] = v }
         o.on("--spa") { opts[:spa] = true }
+        o.on("--[no-]private") { |v| opts[:private] = v }
         o.on("--dry-run") { dry_run = true }
         o.on("-v", "--verbose") { verbose = true }
       end.parse!(argv)
@@ -91,6 +93,7 @@ module Quickhost
       site = Site.new(root: source.root, config: config, options: opts, fallback_name: source.repo_name)
       site.host # validate early
       site.mode
+      @out.puts "→ Private site: sign in as #{config.auth_user}" if site.htpasswd
 
       @out.puts "⚠ Uncommitted changes will be deployed as they are on disk." if !source.remote? && source.dirty?
       @out.puts "(dry run — nothing will change on the server)" if dry_run
