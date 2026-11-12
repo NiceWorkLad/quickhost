@@ -5,6 +5,7 @@ module Quickhost
   # Writes a Docker build context (repo files + Dockerfile + nginx.conf) to a temp folder.
   class BuildContext
     SKIP = %w[.git node_modules .DS_Store].freeze
+    HTPASSWD_PATH = "/etc/nginx/htpasswd".freeze # outside the web root, so it can't be downloaded
 
     attr_reader :dir
 
@@ -17,6 +18,7 @@ module Quickhost
       copy_repo(File.join(@dir, "src"))
       File.write(File.join(@dir, "Dockerfile"), dockerfile)
       File.write(File.join(@dir, "nginx.conf"), nginx_conf)
+      File.write(File.join(@dir, "htpasswd"), @site.htpasswd, perm: 0o644) if @site.private?
       @dir
     end
 
@@ -49,18 +51,24 @@ module Quickhost
           FROM nginx:1.27-alpine
           COPY nginx.conf /etc/nginx/conf.d/default.conf
           COPY --from=build /site/ /usr/share/nginx/html/
+          #{copy_htpasswd}
         DOCKER
       else
         <<~DOCKER
           FROM nginx:1.27-alpine
           COPY nginx.conf /etc/nginx/conf.d/default.conf
           COPY src/#{@site.static_dir == '.' ? '' : "#{@site.static_dir}/"} /usr/share/nginx/html/
+          #{copy_htpasswd}
         DOCKER
       end
     end
 
     def nginx_conf
       fallback = @site.spa? ? "/index.html" : "=404"
+      # Set for the whole server, so every path needs the sign-in unless a location turns it off.
+      auth = if @site.private?
+               "\n  auth_basic \"Private\";\n  auth_basic_user_file #{HTPASSWD_PATH};\n"
+             end
       <<~NGINX
         server {
           listen 80;
@@ -70,9 +78,9 @@ module Quickhost
 
           gzip on;
           gzip_types text/plain text/css application/javascript application/json image/svg+xml;
-
-          # kamal-proxy health check
-          location = /up { access_log off; add_header Content-Type text/plain; return 200 "ok\\n"; }
+        #{auth}
+          # kamal-proxy health check: always open, or a private site could never deploy
+          location = /up { auth_basic off; access_log off; add_header Content-Type text/plain; return 200 "ok\\n"; }
 
           # Never serve dotfiles (.env, .quickhost.yml, ...)
           location ~ /\\.(?!well-known) { deny all; return 404; }
@@ -88,6 +96,10 @@ module Quickhost
     end
 
     private
+
+    def copy_htpasswd
+      "COPY htpasswd #{HTPASSWD_PATH}" if @site.private?
+    end
 
     def copy_repo(dest)
       FileUtils.mkdir_p(dest)

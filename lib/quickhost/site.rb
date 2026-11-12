@@ -1,5 +1,8 @@
 require "json"
 require "yaml"
+require "digest"
+require "base64"
+require "securerandom"
 
 module Quickhost
   # Everything about one site: its name, public host, and how to turn the repo into static files.
@@ -12,7 +15,7 @@ module Quickhost
     attr_reader :name, :root, :options
 
     # options (all optional; CLI flags beat .quickhost.yml):
-    #   name, domain, build, dir, spa, node_image
+    #   name, domain, build, dir, spa, private, node_image
     def initialize(root:, config:, options: {}, fallback_name: nil)
       @root = File.expand_path(root)
       @config = config
@@ -45,6 +48,29 @@ module Quickhost
 
     def spa?
       options["spa"] == true || options["spa"].to_s == "true"
+    end
+
+    # Private sites ask for a username and password (HTTP basic auth) before serving anything.
+    def private?
+      options["private"] == true || options["private"].to_s == "true"
+    end
+
+    # The line for nginx's password file, "user:{SSHA}<hash>", or nil for a public site.
+    # The password is stored salted and hashed, never as plain text. The sign-in comes from
+    # the global config, so no password ever needs committing to a repo.
+    def htpasswd
+      return unless private?
+
+      user = @config.auth_user.to_s
+      password = @config.auth_password.to_s
+      if user.empty? || password.empty?
+        raise Error, "#{name} is private, but no sign-in is set. Add auth_user and auth_password to " \
+                     "#{@config.path}, or set QUICKHOST_AUTH_USER and QUICKHOST_AUTH_PASSWORD."
+      end
+      raise Error, "auth_user can't contain ':' or spaces" if user.match?(/[:\s]/)
+
+      salt = SecureRandom.random_bytes(8)
+      "#{user}:{SSHA}#{Base64.strict_encode64(Digest::SHA1.digest(password + salt) + salt)}\n"
     end
 
     # :custom  — user-supplied build command (+ optional output dir)

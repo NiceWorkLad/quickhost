@@ -119,6 +119,31 @@ Detected automatically, in this order:
 Every site gets clean URLs (`/about` serves `about.html`) and your `404.html` if you have one.
 Dotfiles are never served. `--spa` sends unknown paths to `index.html` for React/Vue routers.
 
+### Private sites
+
+A private site asks for a username and password before it serves anything.
+
+**1.** Set one sign-in for all your private sites in `~/.config/quickhost/config.yml`:
+
+```yaml
+auth_user: louis
+auth_password: a-long-random-password
+```
+
+**2.** Deploy with `--private`, or commit `private: true` in the repo's `.quickhost.yml`:
+
+```bash
+quickhost deploy git@github.com:NiceWorkLad/unaided.git --private
+```
+
+Use the `git@github.com:` form for a private GitHub repo, since the `owner/repo` shorthand clones
+over HTTPS without your SSH key.
+
+- The password is baked into the image as a salted hash, never as plain text. Change it in the
+  config and redeploy for it to take effect.
+- `--no-private` makes a site public again for one deploy, even if the repo says `private: true`.
+- Add the site to `hub_hide` so it stays off the hub page.
+
 ### Per-repo settings: `.quickhost.yml`
 
 Commit this to a repo so you don't have to repeat flags. Command-line flags still win.
@@ -129,6 +154,7 @@ name: keepup                 # → keepup.whittleadams.com
 build: npm ci && npm run build
 dir: dist
 spa: true
+# private: true              # ask for the config's auth_user / auth_password
 # node_image: node:20-alpine
 ```
 
@@ -143,6 +169,8 @@ network: kamal
 proxy_container: kamal-proxy
 tls: true
 keep_images: 3
+auth_user: louis             # only needed for private sites
+auth_password: a-long-random-password
 ```
 
 Any key can be overridden for one run with `QUICKHOST_<KEY>`, e.g.

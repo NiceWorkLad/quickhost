@@ -127,6 +127,64 @@ class BuildContextTest < Minitest::Test
     assert_includes df, "RUN make site"
     assert_includes df, "cp -a out\\ dir/. /site/"
   end
+
+  def test_public_site_has_no_auth
+    site = Quickhost::Site.new(root: repo("index.html" => "x"), config: config)
+    ctx = Quickhost::BuildContext.new(site)
+    dir = ctx.create
+    refute_includes ctx.nginx_conf, "auth_basic_user_file"
+    refute_includes ctx.dockerfile, "htpasswd"
+    refute File.exist?(File.join(dir, "htpasswd"))
+    assert_nil site.htpasswd
+  ensure
+    ctx&.cleanup
+  end
+
+  def test_private_site_asks_for_sign_in_but_keeps_health_check_open
+    site = Quickhost::Site.new(root: repo("index.html" => "x"), options: { private: true },
+                               config: config(auth_user: "louis", auth_password: "s3cret"))
+    ctx = Quickhost::BuildContext.new(site)
+    dir = ctx.create
+    conf = ctx.nginx_conf
+    assert_includes conf, "auth_basic_user_file /etc/nginx/htpasswd;"
+    assert_match(/location = \/up \{ auth_basic off;/, conf)
+    assert_includes ctx.dockerfile, "COPY htpasswd /etc/nginx/htpasswd"
+    assert File.exist?(File.join(dir, "htpasswd"))
+    refute File.exist?(File.join(dir, "src/htpasswd")) # never inside the served files
+  ensure
+    ctx&.cleanup
+  end
+
+  def test_private_build_site_copies_htpasswd_into_final_image
+    site = Quickhost::Site.new(root: repo("a" => "b"), options: { build: "make site", private: true },
+                               config: config(auth_user: "louis", auth_password: "s3cret"))
+    assert_equal "COPY htpasswd /etc/nginx/htpasswd", Quickhost::BuildContext.new(site).dockerfile.lines.last.strip
+  end
+
+  def test_htpasswd_is_salted_hash_nginx_can_check
+    site = Quickhost::Site.new(root: repo("index.html" => "x"), options: { private: true },
+                               config: config(auth_user: "louis", auth_password: "s3cret"))
+    line = site.htpasswd
+    refute_includes line, "s3cret"
+    user, hash = line.strip.split(":", 2)
+    assert_equal "louis", user
+    raw = Base64.strict_decode64(hash.delete_prefix("{SSHA}"))
+    digest, salt = raw[0, 20], raw[20..]
+    assert_equal digest, Digest::SHA1.digest("s3cret" + salt) # what nginx recomputes at sign-in
+    refute_equal line, site.htpasswd                           # fresh salt each time
+  end
+
+  def test_private_without_sign_in_errors
+    site = Quickhost::Site.new(root: repo("index.html" => "x"), config: config, options: { private: true })
+    err = assert_raises(Quickhost::Error) { site.htpasswd }
+    assert_includes err.message, "auth_user"
+  end
+
+  def test_private_from_repo_config_and_no_private_flag_wins
+    root = repo("index.html" => "x", ".quickhost.yml" => "private: true\n")
+    assert Quickhost::Site.new(root: root, config: config).private?
+    refute Quickhost::Site.new(root: root, config: config, options: { private: false }).private?
+  end
 end
 
 class DeployerTest < Minitest::Test
