@@ -3,6 +3,7 @@ require "shellwords"
 
 module Quickhost
   # Runs commands on the server over ssh. In dry-run mode it only prints them.
+  # With server "local" they run on this machine instead (the updater on the server uses that).
   class Remote
     Result = Struct.new(:ok, :out, :err) do
       def ok? = ok
@@ -18,6 +19,7 @@ module Quickhost
     end
 
     def dry_run? = @dry_run
+    def local? = server == "local"
 
     # Run a remote command given as an argv array. Returns Result.
     # stream: true echoes output live (for docker build).
@@ -30,7 +32,7 @@ module Quickhost
         return Result.new(true, "", "")
       end
 
-      ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", server, cmd]
+      ssh = local? ? ["sh", "-c", cmd] : ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", server, cmd]
       result = stream ? run_streaming(ssh, input) : run_captured(ssh, input)
       if !result.ok? && !allow_fail
         raise Error, "Command failed on #{server}: #{cmd}\n#{result.err.strip}"

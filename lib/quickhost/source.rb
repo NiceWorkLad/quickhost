@@ -72,6 +72,31 @@ module Quickhost
       FileUtils.rm_rf(@tmp) if @tmp
     end
 
+    # Where auto-updates would pull from: { repo:, branch: }, or nil when there's no git remote
+    # to follow (a plain folder, a subfolder of a repo, or a repo without an origin).
+    # branch nil means the repo's default branch.
+    def tracking
+      return { repo: self.class.public_url(url), branch: @branch } if remote?
+      return unless git_toplevel_name
+
+      origin, _err, status = git("remote", "get-url", "origin")
+      return unless status.success? && !origin.strip.empty?
+
+      branch = @branch&.delete_prefix("origin/")
+      branch ||= begin
+        head, _err, ok = git("symbolic-ref", "--quiet", "--short", "HEAD") # fails on a detached HEAD
+        ok.success? ? head.strip : nil
+      end
+      branch && { repo: self.class.public_url(origin.strip), branch: branch }
+    end
+
+    # The https form of a git URL, without any embedded login. The server has no ssh keys for
+    # GitHub, and tokens don't belong in container labels.
+    def self.public_url(url)
+      url = url.sub(%r{\A(?:ssh://)?git@([^:/]+)[:/](.+)\z}, 'https://\1/\2')
+      url.sub(%r{\A(https?://)[^/@]+@}, '\1')
+    end
+
     private
 
     def git(*args)

@@ -2,6 +2,7 @@ require "minitest/autorun"
 require "tmpdir"
 require "fileutils"
 require "stringio"
+require "json"
 require_relative "../lib/quickhost"
 
 class FakeRemote
@@ -198,16 +199,124 @@ class DeployerTest < Minitest::Test
     assert_raises(Quickhost::Error) { @deployer.preflight! }
   end
 
+  # What `docker inspect` returns for a site's container.
+  def inspect_json(name, tag, labels = {}, state: "running")
+    JSON.generate([{ "Name" => "/qh-#{name}-#{tag}", "Created" => "2026-11-10T12:00:00Z",
+                     "State" => { "Status" => state },
+                     "Config" => { "Image" => "quickhost/#{name}:#{tag}",
+                                   "Labels" => { "quickhost.site" => name }.merge(labels) } }])
+  end
+
+  def live(name, tag, labels = {})
+    @remote.responses["ps -aq --filter label=quickhost.site=#{name}"] = R.new(true, "abc123\n", "")
+    @remote.responses["docker inspect abc123"] = R.new(true, inspect_json(name, tag, labels), "")
+  end
+
   def test_rollback_picks_previous_image
-    @remote.responses["docker ps --filter label=quickhost.site=blog"] = R.new(true, "qh-blog-20261110120000\n", "")
-    @remote.responses["{{.Config.Image}}"] = R.new(true, "quickhost/blog:20261110120000\n", "")
-    @remote.responses["quickhost.host"] = R.new(true, "blog.example.com\n", "")
-    @remote.responses["image ls quickhost/blog"] = R.new(true, "20261110120000\n20261109120000\n20261108120000\n", "")
+    live("blog", "20261110120000", "quickhost.host" => "blog.example.com")
+    @remote.responses["image ls quickhost/blog"] = R.new(true, "20261110120000\n20261109120000-abc1234\n20261108120000\n", "")
 
     @deployer.rollback("blog")
     log = @remote.log.join("\n")
-    assert_includes log, "quickhost/blog:20261109120000"
+    assert_includes log, "quickhost/blog:20261109120000-abc1234"
     assert_includes log, "--host blog.example.com"
+    assert_includes log, "--label quickhost.revision=abc1234"
+  end
+
+  def test_rollback_turns_auto_updates_off_and_keeps_password
+    live("blog", "2", "quickhost.host" => "blog.example.com", "quickhost.auto" => "true",
+                      "quickhost.repo" => "https://github.com/a/blog.git", "quickhost.auth" => "me:{SSHA}xyz")
+    @remote.responses["image ls quickhost/blog"] = R.new(true, "2\n1\n", "")
+
+    @deployer.rollback("blog")
+    run = @remote.log.find { |c| c.start_with?("docker run") }
+    refute_includes run, "quickhost.auto"
+    assert_includes run, "QH_AUTH=me:{SSHA}xyz"
+    assert_includes @out.string, "quickhost auto on blog"
+  end
+
+  def test_private_deploy_generates_password_and_checks_before_routing
+    root = repo("index.html" => "hi")
+    site = Quickhost::Site.new(root: root, config: config, options: { private: true }, fallback_name: "notes")
+    @deployer.deploy(site, source_for(root))
+
+    user, password, generated = @deployer.credentials
+    assert_equal "quickhost", user
+    assert generated
+    assert_equal 20, password.size
+    assert Quickhost::Auth.matches?(@deployer.meta.auth, password)
+    refute Quickhost::Auth.matches?(@deployer.meta.auth, "wrong")
+    log = @remote.log.join("\n")
+    assert_includes log, "-e QH_AUTH=#{@deployer.meta.auth}"
+    assert_includes log, "--label quickhost.auth=#{@deployer.meta.auth}"
+    assert log.index("test -s /etc/nginx/quickhost/auth.conf") < log.index("kamal-proxy deploy"),
+           "password protection is confirmed before traffic is switched"
+  end
+
+  def test_private_setting_sticks_across_deploys_with_the_same_password
+    live("notes", "1", "quickhost.auth" => "me:{SSHA}old")
+    root = repo("index.html" => "hi")
+    @deployer.deploy(Quickhost::Site.new(root: root, config: config, fallback_name: "notes"), source_for(root))
+    assert_nil @deployer.credentials
+    assert_includes @remote.log.join("\n"), "QH_AUTH=me:{SSHA}old"
+  end
+
+  def test_public_flag_removes_password
+    live("notes", "1", "quickhost.auth" => "me:{SSHA}old")
+    root = repo("index.html" => "hi")
+    site = Quickhost::Site.new(root: root, config: config, options: { private: false }, fallback_name: "notes")
+    @deployer.deploy(site, source_for(root))
+    refute_includes @remote.log.join("\n"), "QH_AUTH"
+  end
+
+  def test_private_refused_when_version_has_no_auth_script
+    live("old", "1", "quickhost.host" => "old.whittleadams.com")
+    @remote.responses["test -s /etc/nginx/quickhost/auth.conf"] = R.new(false, "", "")
+    err = assert_raises(Quickhost::Error) { @deployer.reconfigure("old", private: true) }
+    assert_includes err.message, "Redeploy"
+    log = @remote.log.join("\n")
+    refute_includes log, "kamal-proxy deploy"
+    assert_match(/docker rm -f qh-old-1-c\d{6}/, log)
+  end
+
+  def test_reconfigure_private_restarts_same_version_with_given_password
+    live("blog", "7", "quickhost.host" => "b.example.com", "quickhost.repo" => "https://github.com/a/b.git")
+    @deployer.reconfigure("blog", private: true, user: "louis", password: "s3cret")
+    assert_equal ["louis", "s3cret", false], @deployer.credentials
+    assert Quickhost::Auth.matches?(@deployer.meta.auth, "s3cret")
+    run = @remote.log.find { |c| c.start_with?("docker run") }
+    assert_includes run, "quickhost/blog:7"
+    assert_includes run, "--label quickhost.repo=https://github.com/a/b.git"
+    assert_includes @remote.log.join("\n"), "--host b.example.com"
+  end
+
+  def test_auto_needs_a_git_source
+    live("blog", "7")
+    assert_raises(Quickhost::Error) { @deployer.reconfigure("blog", auto: true) }
+    root = repo("index.html" => "hi")
+    site = Quickhost::Site.new(root: root, config: config, options: { auto: true }, fallback_name: "x")
+    assert_raises(Quickhost::Error) { @deployer.deploy(site, source_for(root)) }
+  end
+
+  def test_auto_deploy_records_source_and_flags
+    root = repo("index.html" => "hi")
+    site = Quickhost::Site.new(root: root, config: config, options: { auto: true, spa: true }, fallback_name: "x")
+    @deployer.deploy(site, source_for(root), track: { repo: "https://github.com/a/x.git", branch: "main" })
+    run = @remote.log.find { |c| c.start_with?("docker run") }
+    assert_includes run, "--label quickhost.auto=true"
+    assert_includes run, "--label quickhost.repo=https://github.com/a/x.git --label quickhost.branch=main"
+    assert_includes run, %(quickhost.options={"spa":true})
+  end
+
+  def test_sites_prefers_running_container
+    two = JSON.parse(inspect_json("blog", "1", {}, state: "exited")) + JSON.parse(inspect_json("blog", "2", { "quickhost.auth" => "u:{SSHA}h" }))
+    @remote.responses["ps -aq --filter label=quickhost.site"] = R.new(true, "a\nb\n", "")
+    @remote.responses["docker inspect a b"] = R.new(true, JSON.generate(two), "")
+    sites = @deployer.sites
+    assert_equal 1, sites.size
+    assert_equal "2", sites.first.tag
+    assert sites.first.meta.private?
+    assert_equal "u", sites.first.meta.user
   end
 
   def test_remove
@@ -218,6 +327,175 @@ class DeployerTest < Minitest::Test
     assert_includes log, "kamal-proxy remove qh-blog"
     assert_includes log, "docker rm -f qh-blog-1"
     assert_includes log, "docker rmi quickhost/blog:1"
+  end
+end
+
+class UpdaterTest < Minitest::Test
+  include Helpers
+
+  Info = Quickhost::SiteInfo
+
+  class FakeDeployer
+    attr_reader :deployed
+    attr_accessor :sites, :fail
+
+    def initialize = @deployed = []
+
+    def deploy(site, source, track: nil, **)
+      raise Quickhost::Error, "build broke" if @fail
+
+      @deployed << [site.name, site.host, site.spa?, source.revision, track]
+    end
+  end
+
+  def setup
+    @origin = repo("index.html" => "v1")
+    system("git", "-C", @origin, "init", "-q", "-b", "main")
+    commit("one")
+    @deployer = FakeDeployer.new
+    @out = StringIO.new
+    @updater = Quickhost::Updater.new(config: config, deployer: @deployer, out: @out)
+  end
+
+  def teardown = FileUtils.rm_rf(@origin)
+
+  def commit(msg)
+    system("git", "-C", @origin, "add", "-A")
+    system("git", "-C", @origin, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", msg)
+    `git -C #{@origin} rev-parse --short HEAD`.strip
+  end
+
+  def site(name, revision, auto: true, options: {})
+    meta = Quickhost::Meta.new(host: "#{name}.example.com", repo: "file://#{@origin}", branch: "main",
+                               revision: revision, auto: auto, options: options)
+    Info.new(name: name, container: "qh-#{name}-1", image: "quickhost/#{name}:1", state: "running", meta: meta)
+  end
+
+  def test_up_to_date_site_is_left_alone
+    head = `git -C #{@origin} rev-parse --short HEAD`.strip
+    @deployer.sites = [site("blog", head)]
+    assert_equal [:current], @updater.run.map(&:result)
+    assert_empty @deployer.deployed
+  end
+
+  def test_new_commit_redeploys_with_same_name_host_and_flags
+    old = `git -C #{@origin} rev-parse --short HEAD`.strip
+    File.write(File.join(@origin, "index.html"), "v2")
+    new = commit("two")
+    @deployer.sites = [site("blog", old, options: { "spa" => true }), site("manual", old, auto: false)]
+
+    assert_equal [:updated], @updater.run.map(&:result)
+    assert_equal [["blog", "blog.example.com", true, new, { repo: "file://#{@origin}", branch: "main" }]], @deployer.deployed
+  end
+
+  def test_named_site_updates_even_with_auto_off_and_force_redeploys
+    head = `git -C #{@origin} rev-parse --short HEAD`.strip
+    @deployer.sites = [site("manual", head, auto: false)]
+    assert_equal [:current], @updater.run(names: ["manual"]).map(&:result)
+    assert_equal [:updated], @updater.run(names: ["manual"], force: true).map(&:result)
+    assert_raises(Quickhost::Error) { @updater.run(names: ["nope"]) }
+  end
+
+  def test_failed_commit_is_not_retried_until_a_new_one_arrives
+    @deployer.sites = [site("blog", "0000000")]
+    @deployer.fail = true
+    assert_equal [:failed], @updater.run(remember_failures: true).map(&:result)
+    assert_equal [:skipped], @updater.run(remember_failures: true).map(&:result)
+    @deployer.fail = false
+    File.write(File.join(@origin, "index.html"), "fixed")
+    commit("fix")
+    assert_equal [:updated], @updater.run(remember_failures: true).map(&:result)
+  end
+
+  def test_intervals
+    assert_equal 300, Quickhost::Updater.parse_interval("5m")
+    assert_equal 90, Quickhost::Updater.parse_interval("90")
+    assert_equal 7200, Quickhost::Updater.parse_interval("2h")
+    assert_equal "5m", Quickhost::Updater.format_interval(300)
+    assert_equal "90s", Quickhost::Updater.format_interval(90)
+    assert_raises(Quickhost::Error) { Quickhost::Updater.parse_interval("5") }
+    assert_raises(Quickhost::Error) { Quickhost::Updater.parse_interval("soon") }
+  end
+
+  def test_updater_service_start_passes_config_and_mounts_docker
+    remote = FakeRemote.new
+    Quickhost::UpdaterService.new(config: config(base_domain: "x.com"), remote: remote, out: @out).start(interval: 120)
+    log = remote.log.join("\n")
+    assert_includes log, "docker build -t quickhost/updater:#{Quickhost::VERSION} -"
+    run = remote.log.find { |c| c.start_with?("docker run") }
+    assert_includes run, "-v /var/run/docker.sock:/var/run/docker.sock"
+    assert_includes run, "-e QUICKHOST_BASE_DOMAIN=x.com"
+    assert_includes run, "--label quickhost.interval=120"
+    assert run.end_with?("update --watch 120")
+  end
+end
+
+class TrackingTest < Minitest::Test
+  def test_public_url
+    assert_equal "https://github.com/a/b.git", Quickhost::Source.public_url("git@github.com:a/b.git")
+    assert_equal "https://github.com/a/b.git", Quickhost::Source.public_url("ssh://git@github.com/a/b.git")
+    assert_equal "https://github.com/a/b.git", Quickhost::Source.public_url("https://tok3n@github.com/a/b.git")
+    assert_equal "https://github.com/a/b.git", Quickhost::Source.public_url("https://github.com/a/b.git")
+  end
+
+  def test_remote_source_tracks_its_url
+    assert_equal({ repo: "https://github.com/NiceWorkLad/Ball-Game.git", branch: "dev" },
+                 Quickhost::Source.new("NiceWorkLad/Ball-Game", branch: "dev").tracking)
+  end
+
+  def test_local_repo_tracks_origin_and_current_branch
+    dir = Dir.mktmpdir("qh-track-")
+    File.write(File.join(dir, "index.html"), "x")
+    assert_nil Quickhost::Source.new(dir).prepare.tracking, "plain folder"
+    system("git", "-C", dir, "init", "-q", "-b", "trunk")
+    assert_nil Quickhost::Source.new(dir).prepare.tracking, "no origin"
+    system("git", "-C", dir, "remote", "add", "origin", "git@github.com:a/site.git")
+    assert_equal({ repo: "https://github.com/a/site.git", branch: "trunk" }, Quickhost::Source.new(dir).prepare.tracking)
+    FileUtils.mkdir_p(File.join(dir, "sub"))
+    assert_nil Quickhost::Source.new(File.join(dir, "sub")).prepare.tracking, "subfolder"
+  ensure
+    FileUtils.rm_rf(dir)
+  end
+end
+
+class PrivateBuildTest < Minitest::Test
+  include Helpers
+
+  def test_every_image_can_be_made_private
+    site = Quickhost::Site.new(root: repo("index.html" => "hi"), config: config)
+    ctx = Quickhost::BuildContext.new(site)
+    dir = ctx.create
+    assert_includes ctx.dockerfile, "chmod 755 /docker-entrypoint.d/40-quickhost-auth.sh"
+    assert_includes ctx.nginx_conf, "include /etc/nginx/quickhost/*.conf;"
+    assert_includes ctx.nginx_conf, "location = /up { auth_basic off;"
+    assert File.executable?(File.join(dir, "auth.sh"))
+  ensure
+    ctx&.cleanup
+  end
+
+  # Runs the real script (with /etc paths pointed at a temp folder) the way the container would.
+  def test_auth_script_writes_and_clears_config
+    dir = Dir.mktmpdir("qh-auth-")
+    script = Quickhost::BuildContext::AUTH_SCRIPT.gsub(Quickhost::BuildContext::AUTH_DIR, dir)
+    line = Quickhost::Auth.htpasswd("me", "pa$$ word'\"")
+    assert system({ "QH_AUTH" => line }, "sh", "-c", script)
+    assert_equal "#{line}\n", File.read(File.join(dir, "htpasswd"))
+    assert_equal %(auth_basic "Private site";\nauth_basic_user_file #{dir}/htpasswd;\n), File.read(File.join(dir, "auth.conf"))
+    assert system({ "QH_AUTH" => nil }, "sh", "-c", script)
+    refute File.exist?(File.join(dir, "auth.conf")), "restarting without a password makes the site public again"
+  ensure
+    FileUtils.rm_rf(dir)
+  end
+
+  def test_repo_config_can_ask_for_private_and_flags_win
+    root = repo("index.html" => "x", ".quickhost.yml" => "private: true\nauto: false\n")
+    site = Quickhost::Site.new(root: root, config: config)
+    assert_equal true, site.private
+    assert_equal false, site.auto
+    assert_equal false, Quickhost::Site.new(root: root, config: config, options: { private: false }).private
+    plain = Quickhost::Site.new(root: repo("index.html" => "x"), config: config, options: { spa: true, name: "n" })
+    assert_nil plain.private
+    assert_equal({ "spa" => true }, plain.persisted_options)
   end
 end
 
@@ -397,6 +675,14 @@ class HubTest < Minitest::Test
     entries = hub(hub_hide: ["map.whittleadams.com"]).entries
     assert_equal %w[diary.whittleadams.com oaat.whittleadams.com], entries.map(&:host)
     assert_equal %w[oaat.whittleadams.com], hub(hub_hide: "diary,map.whittleadams.com").entries.map(&:host)
+  end
+
+  def test_private_sites_stay_off_the_hub
+    routes = Struct.new(:proxy_list, :sites).new(TABLE, [
+      Quickhost::SiteInfo.new(name: "oaat", meta: Quickhost::Meta.new(host: "oaat.whittleadams.com", auth: "u:{SSHA}h"))
+    ])
+    hub = OfflineHub.new(config: config, deployer: nil, routes_from: routes, out: StringIO.new)
+    assert_equal %w[diary.whittleadams.com map.whittleadams.com], hub.entries.map(&:host).sort
   end
 
   def test_hub_sites_overrides_wording

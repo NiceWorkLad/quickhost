@@ -27,6 +27,10 @@ alongside your Kamal apps without touching them.
    for the new container's `/up` health check, switches traffic, and gets a Let's Encrypt cert.
 5. Removes the old container and keeps the last 3 images so you can roll back.
 
+What quickhost knows about a site (where it came from, whether it's private, whether it
+auto-updates) is stored as Docker labels on the site's container, so there is no state file to
+keep in sync between machines.
+
 If the build or health check fails, the new container is thrown away and the current site
 keeps serving.
 
@@ -69,13 +73,117 @@ quickhost deploy --name keepup         # → keepup.whittleadams.com
 quickhost deploy --domain games.example.com   # any hostname you own; point its DNS at your IP first
 quickhost deploy --dry-run             # show the server commands, change nothing
 
-quickhost list                         # every site, URL, version, status
-quickhost logs ball-game -f            # nginx access log
+quickhost deploy --private             # ask visitors for a password (see "Private sites")
+quickhost deploy owner/repo --auto     # redeploy by itself on new commits (see "Auto-updates")
+
+quickhost list                         # every site: URL, version, age, state, access, auto-updates
+quickhost status ball-game             # everything about one site, plus a live check
+quickhost open ball-game               # open it in your browser
+quickhost logs ball-game -f            # nginx access log (--tail N for more history)
 quickhost rollback ball-game           # back to the previous version
 quickhost rollback ball-game --to 20261110143000-5af19fc
 quickhost remove ball-game             # take it offline and delete images
 quickhost hub                          # link page of every site → sites.whittleadams.com
 ```
+
+### Looking at what's running
+
+```
+$ quickhost list
+NAME       URL                                 VERSION                 DEPLOYED  STATE    ACCESS   AUTO
+ball-game  https://ball-game.whittleadams.com  20261110143000-5af19fc  6d ago    running  private  on
+notes      https://notes.whittleadams.com      20261115090000          2d ago    running  public   -
+
+$ quickhost status ball-game
+ball-game
+  URL          https://ball-game.whittleadams.com
+  State        running (qh-ball-game-20261110143000-5af19fc)
+  Responds     401 — asks for a password, as it should
+  Version      20261110143000-5af19fc — deployed 10 Nov 2026 14:30 UTC, 6d ago
+  Source       https://github.com/NiceWorkLad/Ball-Game.git @ 5af19fc
+  Access       private (user: louis)
+  Auto-update  on — updater checks every 5m
+  Route        qh-ball-game → running
+  Versions     20261110143000-5af19fc  ← live
+               20261101120000-aaa1111
+```
+
+`status` fetches the site the way a visitor would, so it also tells you if a private site is
+answering without a password. `Versions` are what `rollback --to` accepts. Both commands take
+`--json` for scripts. In the `AUTO` column, `-` means the site wasn't deployed from a git remote,
+so there is nothing to follow.
+
+### Private sites
+
+A private site asks every visitor for a username and password (HTTP basic auth, over HTTPS)
+before it serves anything.
+
+```bash
+quickhost deploy --private                      # generates a password and prints it once
+quickhost deploy --private --password hunter22 --user louis
+quickhost private notes                         # make a live site private, no rebuild
+quickhost private notes --password hunter22     # …or change its password
+quickhost public notes                          # open it up again
+```
+
+- The setting sticks. Later deploys, rollbacks and auto-updates keep the site private with the
+  same login until you run `quickhost public` or deploy with `--public`.
+- Only a salted hash of the password is stored, on the server. A generated password can't be
+  shown again; `quickhost private NAME` sets a new one. To keep a password out of your shell
+  history, put it in `QUICKHOST_PASSWORD` instead of `--password`.
+- The default username is `quickhost` (`private_user` in the config).
+- Private sites are left off the hub page.
+- Before switching traffic, quickhost checks that the new container really is asking for a
+  password, and stops if it isn't. Sites deployed with quickhost 0.2 or older need one redeploy
+  before `quickhost private` works on them.
+
+### Auto-updates
+
+With auto-updates on, a site redeploys by itself when its branch gets new commits, like GitHub
+Pages. It is off unless you turn it on, per site.
+
+```bash
+quickhost auto start                   # once: install the updater on the server
+quickhost deploy NiceWorkLad/Ball-Game --auto
+quickhost auto on ball-game            # or turn it on for a site that's already live
+quickhost auto off ball-game
+
+quickhost auto                         # is it on? updater state, and what each site follows
+quickhost auto logs -f                 # what the updater has been doing
+quickhost update                       # check now instead of waiting (every site with auto on)
+quickhost update ball-game --force     # redeploy one site from its repo, new commits or not
+quickhost auto stop                    # remove the updater; sites stay as they are
+```
+
+```
+$ quickhost auto
+Updater: ON — running on louislab.duckdns.org, checks every 5m
+  [2026-11-16 21:00:00Z] checked 2 sites: 2 current
+
+SITE       AUTO  FOLLOWS
+ball-game  on    https://github.com/NiceWorkLad/Ball-Game.git @ 5af19fc
+blog       off   https://github.com/NiceWorkLad/blog.git (main) @ 1234567
+notes      -     no git source recorded
+```
+
+How it works: the updater is a small container (`qh-updater`) on the server holding a copy of
+quickhost. Every 5 minutes (`quickhost auto start --interval 2m` to change it) it asks each
+followed repo for its newest commit and, if that differs from what is live, clones and deploys it
+with the same name, host, build flags and privacy as before. A commit that fails to build leaves
+the live site alone and isn't retried until you push another.
+
+Things to know:
+
+- A site can only follow a git remote. Deploying `owner/repo` or a git URL records it. Deploying
+  a local repo records its `origin` and current branch, and then **what is pushed wins**: local
+  changes you deployed but didn't push are replaced at the next check.
+- The updater clones over https without credentials, so it can follow public repos only.
+- `quickhost rollback` turns auto-updates off for that site, otherwise the updater would put the
+  newer commit straight back. Turn it on again with `quickhost auto on NAME`.
+- The updater has access to the server's Docker (it mounts the Docker socket), which it needs to
+  build and start sites.
+- After upgrading quickhost, run `quickhost auto start` again to give the updater the new version.
+  `quickhost auto` tells you when they differ.
 
 ### The hub page
 
@@ -130,6 +238,8 @@ build: npm ci && npm run build
 dir: dist
 spa: true
 # node_image: node:20-alpine
+# private: true              # password protected (the password itself is never stored in the repo)
+# auto: true                 # follow new commits
 ```
 
 ## Global config
@@ -143,6 +253,8 @@ network: kamal
 proxy_container: kamal-proxy
 tls: true
 keep_images: 3
+private_user: quickhost      # default username for private sites
+auto_interval: 300           # seconds between the updater's checks
 ```
 
 Any key can be overridden for one run with `QUICKHOST_<KEY>`, e.g.

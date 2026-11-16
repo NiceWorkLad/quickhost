@@ -1,8 +1,5 @@
 require "cgi"
-require "net/http"
-require "openssl"
 require "time"
-require "timeout"
 require "tmpdir"
 require "fileutils"
 
@@ -20,7 +17,6 @@ module Quickhost
     # Stand-in for Source: Deployer only asks a source for its revision.
     HubSource = Struct.new(:revision)
 
-    FETCH_TIMEOUT = 6
     ANSI = /\e\[[\d;]*m/
 
     # routes_from: anything with #proxy_list (a Deployer on a live connection, so listing and
@@ -58,8 +54,12 @@ module Quickhost
       @entries ||= begin
         hidden = Array(@config.hub_hide).flat_map { |h| h.to_s.split(",") }.map(&:strip)
         routes = self.class.parse_routes(@routes_from.proxy_list)
+        # Private sites stay off the page: it's public, and they'd only show a password prompt.
+        secret = @routes_from.respond_to?(:sites) ? @routes_from.sites.select { |i| i.meta.private? } : []
+        secret = secret.flat_map { |i| ["#{Site::SERVICE_PREFIX}#{i.name}", i.host] }
         routes.reject! do |r|
-          r[:service] == "#{Site::SERVICE_PREFIX}#{name}" || r[:host] == host || self.class.keys_for(r).intersect?(hidden)
+          r[:service] == "#{Site::SERVICE_PREFIX}#{name}" || r[:host] == host ||
+            secret.include?(r[:service]) || secret.include?(r[:host]) || self.class.keys_for(r).intersect?(hidden)
         end
         threads = routes.map { |r| Thread.new { describe(r) } }
         threads.map(&:value).sort_by { |e| e.title.downcase }
@@ -117,21 +117,7 @@ module Quickhost
       key && sites[key].is_a?(Hash) ? sites[key].transform_keys(&:to_s) : {}
     end
 
-    def fetch(url, redirects: 3)
-      uri = URI(url)
-      res = Timeout.timeout(FETCH_TIMEOUT * 2) do
-        Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
-                                            open_timeout: FETCH_TIMEOUT, read_timeout: FETCH_TIMEOUT) do |http|
-          http.get(uri.request_uri, "User-Agent" => "quickhost-hub", "Accept" => "text/html")
-        end
-      end
-      if res.is_a?(Net::HTTPRedirection) && redirects.positive? && res["location"]
-        return fetch(URI.join(url, res["location"]).to_s, redirects: redirects - 1)
-      end
-      [res.code.to_i, res.body.to_s.byteslice(0, 2_000_000).force_encoding("UTF-8").scrub]
-    rescue StandardError, Timeout::Error => e
-      [e.class.name.split("::").last, ""]
-    end
+    def fetch(url) = Probe.get(url)
 
     def meta_title(body)
       clean(body[%r{<title[^>]*>(.*?)</title>}im, 1])

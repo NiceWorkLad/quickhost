@@ -12,6 +12,8 @@ module Quickhost
       "proxy_container" => "kamal-proxy",          # name of the running kamal-proxy container
       "tls"             => true,                   # let kamal-proxy fetch Let's Encrypt certs
       "keep_images"     => 3,                      # old images kept per site for rollback
+      "private_user"    => "quickhost",            # default username for private (password-protected) sites
+      "auto_interval"   => 300,                    # seconds between the updater's checks for new commits
       "hub_name"        => "sites",                # `quickhost hub` lands on <hub_name>.<base_domain>
       "hub_hide"        => [],                     # sites to leave off the hub: name, host, or subdomain
       "hub_sites"       => {}                      # per-site hub wording: { map: { title:, description: } }

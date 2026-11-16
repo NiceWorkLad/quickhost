@@ -8,15 +8,17 @@ module Quickhost
     OUTPUT_DIRS = %w[dist build out _site public www].freeze
     REPO_CONFIG = ".quickhost.yml".freeze
     LABEL = "quickhost.site".freeze
+    PERSISTED = %w[build dir spa node_image].freeze  # deploy flags remembered for auto-updates
 
     attr_reader :name, :root, :options
 
     # options (all optional; CLI flags beat .quickhost.yml):
-    #   name, domain, build, dir, spa, node_image
+    #   name, domain, build, dir, spa, node_image, private, auto
     def initialize(root:, config:, options: {}, fallback_name: nil)
       @root = File.expand_path(root)
       @config = config
-      @options = repo_options.merge(options.compact.transform_keys(&:to_s))
+      @flags = options.compact.transform_keys(&:to_s)
+      @options = repo_options.merge(@flags)
       @name = self.class.sanitize(@options["name"] || fallback_name || File.basename(@root))
       raise Error, "Could not work out a site name; pass --name" if @name.empty?
     end
@@ -46,6 +48,13 @@ module Quickhost
     def spa?
       options["spa"] == true || options["spa"].to_s == "true"
     end
+
+    # true / false when a flag or .quickhost.yml says so; nil means "leave it as it is now".
+    def private = tri_state("private")
+    def auto = tri_state("auto")
+
+    # The flags this deploy was given, so an auto-update can repeat it.
+    def persisted_options = @flags.slice(*PERSISTED)
 
     # :custom  — user-supplied build command (+ optional output dir)
     # :npm     — package.json with a "build" script
@@ -100,6 +109,11 @@ module Quickhost
     end
 
     private
+
+    def tri_state(key)
+      value = options[key]
+      value.nil? ? nil : value == true || value.to_s == "true"
+    end
 
     def runner
       if exists?("pnpm-lock.yaml") then "pnpm"
